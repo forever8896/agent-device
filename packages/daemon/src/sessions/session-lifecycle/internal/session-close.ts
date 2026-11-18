@@ -1,6 +1,7 @@
 import type { EnvMap, HostEnvironment } from '@agent-device/kernel/source-value';
 import type { DaemonResponse } from '@agent-device/kernel/contracts';
 import type { DaemonPlatformServices } from '../../../core/platform-services.ts';
+import type { DeviceBootObservationService } from '@agent-device/contracts/device-boot';
 import { emitDiagnostic } from '@agent-device/host-kit/diagnostics';
 import { AppError, normalizeError } from '@agent-device/kernel/errors';
 import type { LeaseLifecycleProvider, TargetShutdownResult } from '@agent-device/contracts/device';
@@ -357,6 +358,7 @@ export async function handleSessionCloseCommands(
       clearRuntimeHints: admission.clearRuntimeHints,
       repairArmed: repair.repairArmed,
       platformResourceCleanup,
+      observeDeviceBoot: params.platformServices.deviceBootObservation,
       deviceShutdownDenied: params.deviceShutdownDenied,
     }),
   );
@@ -369,6 +371,7 @@ export async function handleSessionCloseCommands(
     providerData: closed.providerData,
     implicitShutdownDeniedByPolicy: closed.implicitShutdownDeniedByPolicy,
     implicitShutdownClaimLost: closed.implicitShutdownClaimLost,
+    implicitShutdownDeviceRebooted: closed.implicitShutdownDeviceRebooted,
   });
   return remoteCloseScriptDelivery(response, closed.remoteScript);
 }
@@ -401,6 +404,8 @@ type SessionCloseFinalization =
       /** #4162: the policy denied the stop this close owed its own boot, so the device kept running. */
       implicitShutdownDeniedByPolicy: boolean;
       implicitShutdownClaimLost: boolean;
+      /** #4585: the device has been rebooted outside this session since its open, so close left it running. */
+      implicitShutdownDeviceRebooted: boolean;
     };
 
 // Everything between a settled repair decision and a success response:
@@ -422,6 +427,8 @@ async function runCloseTeardownAndRelease(params: {
   repairArmed: boolean;
   platformResourceCleanup: PlatformResourceCleanup;
   deviceShutdownDenied?: boolean;
+  /** Boot observation for the implicit stop's #4585 check, forwarded to the teardown. */
+  observeDeviceBoot?: DeviceBootObservationService;
 }): Promise<SessionCloseFinalization> {
   const {
     req,
@@ -443,6 +450,7 @@ async function runCloseTeardownAndRelease(params: {
     shutdownResult,
     implicitShutdownDeniedByPolicy,
     implicitShutdownClaimLost,
+    implicitShutdownDeviceRebooted,
   } = await runSessionCloseTeardown({
     env: params.env,
     leaseRegistry,
@@ -458,6 +466,7 @@ async function runCloseTeardownAndRelease(params: {
     finalizeOrdinaryCloseScript,
     platformResourceCleanup: params.platformResourceCleanup,
     deviceShutdownDenied: params.deviceShutdownDenied,
+    observeDeviceBoot: params.observeDeviceBoot,
   });
   let session = sessionStore.requireCurrent(ref);
   // Each cleanup report is built where the session's fate is decided, so its diagnostic and hint
@@ -506,6 +515,7 @@ async function runCloseTeardownAndRelease(params: {
     remoteScript: saveScriptOutcome.remote,
     implicitShutdownDeniedByPolicy,
     implicitShutdownClaimLost,
+    implicitShutdownDeviceRebooted,
   };
 }
 
@@ -517,6 +527,7 @@ function buildCloseSuccessResponse(params: {
   providerData: Record<string, unknown> | undefined;
   implicitShutdownDeniedByPolicy: boolean;
   implicitShutdownClaimLost: boolean;
+  implicitShutdownDeviceRebooted: boolean;
 }): DaemonResponse {
   const {
     session,
@@ -526,6 +537,7 @@ function buildCloseSuccessResponse(params: {
     providerData,
     implicitShutdownDeniedByPolicy,
     implicitShutdownClaimLost,
+    implicitShutdownDeviceRebooted,
   } = params;
   if (repair.aborted && requestedSaveScript) {
     return {
@@ -562,6 +574,15 @@ function buildCloseSuccessResponse(params: {
     appendResponseWarning(
       data,
       "This session's open booted this device, but close could not verify its device claim and did not request a stop.",
+    );
+  }
+  // #4585: the stop this session owed was a stop owed to the boot its own open caused. The device
+  // has since been through a boot this session never described, so stopping it now would stop
+  // someone else's device. Say which device close left running, and why.
+  if (implicitShutdownDeviceRebooted) {
+    appendResponseWarning(
+      data,
+      "This session's open booted this device, but the device has been rebooted since then and close would stop that later boot, so it did not request a stop. The device is still running.",
     );
   }
   return { ok: true, data };

@@ -423,13 +423,27 @@ export class SessionStore {
     session.lastActivityAtMs = atMs;
   }
 
-  /** Carries boot ownership across reopens of the same device, never onto a replacement. */
+  /**
+   * Carries boot ownership across reopens of the same device, never onto a replacement. A reopen
+   * that boots the device again re-stamps when that boot was reported; a reopen that only keeps the
+   * existing ownership keeps the original stamp, so an outside reboot that happened before the
+   * reopen stays visible to close.
+   */
   updateOpenDevice(ref: SessionRef, device: DeviceInfo, bootOccurred: boolean): void {
     const current = this.requireCurrent(ref);
     const retainsBoot = sameDeviceIdentity(deviceIdentity(current.device), deviceIdentity(device));
+    const ownsBoot = bootOccurred || (retainsBoot && current.bootedByOpen === true);
     this.update(ref, {
       device,
-      bootedByOpen: bootOccurred || (retainsBoot && current.bootedByOpen) ? true : undefined,
+      bootedByOpen: ownsBoot ? true : undefined,
+      // Stamped when the boot is reported, which is after the device came up: the session's own
+      // boot therefore always began at or before this, and a boot that began after it cannot be the
+      // session's. Carried with the ownership it describes, so the two cannot disagree.
+      bootedByOpenAtMs: ownsBoot
+        ? bootOccurred
+          ? Date.now()
+          : current.bootedByOpenAtMs
+        : undefined,
     });
   }
 

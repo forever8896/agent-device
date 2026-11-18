@@ -1,6 +1,6 @@
-// #4585 reproducer: plain `close` after an external emulator reboot. This is a review artifact, not
-// merged coverage. The external-reboot case fails on purpose until implicit-stop authority is tied to
-// the boot this session caused. See the commit message for the recorded concrete results.
+// #4585: plain `close` owes a stop to the boot its own `open` caused, not to whichever boot the
+// device is running now. Routed through the session command handler, so claim acquisition, renewal,
+// boot stamping and close teardown all run against real claim files.
 import { beforeEach, expect, test, vi } from 'vitest';
 import path from 'node:path';
 import * as hostProcess from '@agent-device/host-kit/process';
@@ -35,7 +35,11 @@ import {
   applicationLifecycleRuntimeFixture,
   type LifecycleOperationsLoader,
 } from '../../../../__tests__/support/application-lifecycle-runtime-fixture.ts';
-import { inspectDeviceClaims } from '@agent-device/daemon-contracts/device-claims';
+import {
+  acquireDeviceClaim,
+  clearDeviceClaim,
+  inspectDeviceClaims,
+} from '@agent-device/daemon-contracts/device-claims';
 import type { DeviceBootObservation } from '@agent-device/contracts/device-boot';
 import type { DaemonPlatformServices } from '../../../../core/platform-services.ts';
 import { SessionStore } from '../../../../core/session-store.ts';
@@ -44,6 +48,20 @@ import type { DeviceInfo } from '@agent-device/kernel/device';
 
 pinOwnProcessStartTime(hostProcess);
 bindTestCommandHost();
+
+/** The clock every case runs on, so a boot epoch is a named instant rather than an elapsed guess. */
+const CLOCK_START_MS = Date.UTC(2026, 0, 15, 10, 0, 0);
+/** How far after the cold open a case places the emulator's next boot, and how long it has been up. */
+const LATER_BOOT_DELAY_MS = 60_000;
+const LATER_BOOT_UPTIME_MS = 45_000;
+/** How long before a case's own boot a prior session's claim was taken. */
+const PRIOR_CLAIM_GAP_MS = 30 * 60_000;
+
+const SESSION = 'implicit-shutdown-session';
+
+/** The boot epoch of an emulator restarted outside the session: past, and later than the open's. */
+const LATER_BOOT_MS = CLOCK_START_MS + LATER_BOOT_DELAY_MS - LATER_BOOT_UPTIME_MS;
+const REBOOTED: DeviceBootObservation = { observed: true, bootedAtMs: LATER_BOOT_MS };
 
 /** The AVD as inventory lists it while stopped: addressed by its AVD name, not booted. */
 const STOPPED_AVD: DeviceInfo = {
@@ -54,7 +72,7 @@ const STOPPED_AVD: DeviceInfo = {
   booted: false,
 };
 
-/** The same emulator once it runs. An external reboot keeps this identity and serial. */
+/** The same emulator once it runs. An outside reboot keeps this identity and serial. */
 const BOOTED_EMULATOR: DeviceInfo = {
   platform: 'android',
   id: 'emulator-5554',
@@ -63,131 +81,154 @@ const BOOTED_EMULATOR: DeviceInfo = {
   booted: true,
 };
 
-type Runs = Readonly<{
-  env: NodeJS.ProcessEnv;
-  boot: { current: DeviceBootObservation };
-  platformServices: DaemonPlatformServices;
-  sessionStore: SessionStore;
-  logPath: string;
-}>;
-
-function makeRuns(): Runs {
-  const stateDir = mkdtempForTestSync('agent-device-external-reboot-');
+function createRoutedSession(
+  observeBootTimeMs?: (device: DeviceInfo) => Promise<DeviceBootObservation>,
+) {
+  const stateDir = mkdtempForTestSync('agent-device-session-close-reboot-');
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     AGENT_DEVICE_CLAIMS_DIR: path.join(stateDir, 'claims'),
   };
-  // The boot observation is the one fact a case changes. It is the service root composition gives
-  // claim acquisition, and it already answers for an Android emulator through `/proc/uptime`. While
-  // the emulator is stopped the host reports no boot epoch for its serial, which is why the cold
-  // open's boot is the first observation any case gets.
+  // The composed boot-observation service is the one root composition hands the claim owner and
+  // close alike; its answer is the only fact a case changes. While the emulator is stopped the host
+  // reports no boot epoch for its serial, so the cold open's boot is the first answer.
   const boot: { current: DeviceBootObservation } = {
     current: { observed: false, reason: 'unobserved' },
   };
+  let bootAsks = 0;
   const platformServices = daemonPlatformServicesFixture({
     deviceBootObservation: Object.freeze({
-      observeBootTimeMs: async (): Promise<DeviceBootObservation> => boot.current,
+      observeBootTimeMs: async (device: DeviceInfo): Promise<DeviceBootObservation> => {
+        bootAsks += 1;
+        return (await observeBootTimeMs?.(device)) ?? boot.current;
+      },
     }),
   }) as unknown as DaemonPlatformServices;
-  return {
+  const sessionStore = new SessionStore(path.join(stateDir, 'sessions'), {
     env,
-    boot,
-    platformServices,
-    sessionStore: new SessionStore(path.join(stateDir, 'sessions'), {
+    cwd: process.cwd(),
+  });
+
+  async function run(command: {
+    name: 'open' | 'close';
+    flags?: Record<string, unknown>;
+    /** Only a cold open selects a device, and that selection is what boots the stopped AVD. */
+    selectsDevice?: boolean;
+    deviceShutdownDenied?: boolean;
+  }) {
+    if (command.selectsDevice) {
+      vi.mocked(resolveTargetDevice).mockResolvedValue(STOPPED_AVD);
+      mockEnsureReadyRuntime.mockResolvedValue(BOOTED_EMULATOR);
+    }
+    // Plain close is recorded at the lifecycle port the close dispatches, and the leaf
+    // `shutdownTarget` stays the harness's own, so `mockShutdownTargetRuntime` counts the stop the
+    // platform was actually asked to perform.
+    const finalizeAsks: Array<Readonly<{ shutdownTarget: boolean; retainRunner: boolean }>> = [];
+    const loader: LifecycleOperationsLoader = async (device, signal, shutdownTarget) => {
+      const operations = await applicationLifecycleRuntimeFixture(device, signal, shutdownTarget);
+      const finalizeApplicationClose = operations.finalizeApplicationClose;
+      return Object.freeze({
+        ...operations,
+        finalizeApplicationClose: async (input) => {
+          finalizeAsks.push({
+            shutdownTarget: input.shutdownTarget === true,
+            retainRunner: input.retainRunner === true,
+          });
+          return await finalizeApplicationClose(input);
+        },
+      });
+    };
+    const response = await handleSessionCommands({
+      host: createTestHostEnvironment({ env }),
+      createCommandSurface: fakeCreateCommandSurface,
+      platformServices,
+      sessionStore,
+      invoke: async () => ({ ok: true, data: {} }),
+      lifecycleOperationsLoader: loader,
+      ...(command.deviceShutdownDenied === undefined
+        ? {}
+        : { deviceShutdownDenied: command.deviceShutdownDenied }),
+      req: {
+        token: 't',
+        command: command.name,
+        session: SESSION,
+        positionals: ['Demo'],
+        flags: command.flags ?? {},
+      },
+      sessionName: SESSION,
+      logPath: path.join(stateDir, 'daemon.log'),
+    });
+    return { response, finalizeAsks };
+  }
+
+  function sessionClaim() {
+    const claim = inspectDeviceClaims({ serial: BOOTED_EMULATOR.id }, env)[0]?.claim;
+    if (!claim) throw new Error('expected the session to hold its claim');
+    return claim;
+  }
+
+  /** Claims on disk for this case's device, which a successful close releases with the session. */
+  function sessionClaimCount() {
+    return inspectDeviceClaims({ serial: BOOTED_EMULATOR.id }, env).length;
+  }
+
+  /**
+   * Leaves a claim on disk for this device, taken by the same session name, workspace and daemon.
+   * That is the shape a session inherits when a previous one ended without clearing its claim, and
+   * the acquisition that follows renews that claim rather than taking a new one.
+   */
+  async function plantPriorClaim() {
+    const acquired = await acquireDeviceClaim({
+      device: BOOTED_EMULATOR,
+      session: SESSION,
+      workspace: process.cwd(),
+      stateDir: sessionStore.resolveDaemonStateDir(),
       env,
-      cwd: process.cwd(),
-    }),
-    logPath: path.join(stateDir, 'daemon.log'),
+      reconcileOrphanedDeviceClaim: async () => ({ status: 'reconciled' as const }),
+    });
+    if (acquired.status !== 'acquired') throw new Error('expected to plant a prior claim');
+  }
+
+  return {
+    boot,
+    /** Asks the boot-observation service answered, so a case can prove the device was not probed. */
+    bootAsks: () => bootAsks,
+    dropSessionClaim: async () => {
+      const ownership = sessionStore.get(SESSION)?.deviceClaim;
+      if (!ownership) throw new Error('expected the session to record its claim');
+      await clearDeviceClaim(ownership, env);
+    },
+    plantPriorClaim,
+    run,
+    sessionClaim,
+    sessionClaimCount,
+    sessionStore,
   };
-}
-
-/** Cold open of the stopped AVD through the session route: readiness boots it on its serial. */
-async function coldOpen(runs: Runs, session: string) {
-  vi.mocked(resolveTargetDevice).mockResolvedValue(STOPPED_AVD);
-  mockEnsureReadyRuntime.mockImplementation(async () => BOOTED_EMULATOR);
-  const response = await handleSessionCommands({
-    host: createTestHostEnvironment({ env: runs.env }),
-    createCommandSurface: fakeCreateCommandSurface,
-    platformServices: runs.platformServices,
-    sessionStore: runs.sessionStore,
-    invoke: async () => ({ ok: true, data: {} }),
-    req: {
-      token: 't',
-      command: 'open',
-      session,
-      positionals: ['Demo'],
-      flags: { platform: 'android', device: STOPPED_AVD.name },
-    },
-    sessionName: session,
-    logPath: runs.logPath,
-  });
-  expect(response?.ok).toBe(true);
-}
-
-/** Reopen the same session on the same device identity. No selector, so no new selection. */
-function reopenSession(runs: Runs, session: string) {
-  return handleSessionCommands({
-    host: createTestHostEnvironment({ env: runs.env }),
-    createCommandSurface: fakeCreateCommandSurface,
-    platformServices: runs.platformServices,
-    sessionStore: runs.sessionStore,
-    invoke: async () => ({ ok: true, data: {} }),
-    req: {
-      token: 't',
-      command: 'open',
-      session,
-      positionals: ['Demo'],
-      flags: { platform: 'android' },
-    },
-    sessionName: session,
-    logPath: runs.logPath,
-  });
 }
 
 /**
- * Plain close, recording the finalization ask at the lifecycle port. The leaf `shutdownTarget` stays
- * the harness's own, so `mockShutdownTargetRuntime` counts the stop the platform was actually asked
- * to perform.
+ * Opens a stopped AVD through the cold route and leaves the emulator running on the boot this
+ * session caused. The clock stays fake so a case can name a later boot instead of waiting one out.
  */
-async function closeSession(runs: Runs, session: string) {
-  const finalizeAsks: Array<Readonly<{ shutdownTarget: boolean; retainRunner: boolean }>> = [];
-  const loader: LifecycleOperationsLoader = async (device, signal, shutdownTarget) => {
-    const operations = await applicationLifecycleRuntimeFixture(device, signal, shutdownTarget);
-    const finalizeApplicationClose = operations.finalizeApplicationClose;
-    return Object.freeze({
-      ...operations,
-      finalizeApplicationClose: async (input) => {
-        finalizeAsks.push({
-          shutdownTarget: input.shutdownTarget === true,
-          retainRunner: input.retainRunner === true,
-        });
-        return await finalizeApplicationClose(input);
-      },
-    });
-  };
-  const response = await handleSessionCommands({
-    host: createTestHostEnvironment({ env: runs.env }),
-    createCommandSurface: fakeCreateCommandSurface,
-    platformServices: runs.platformServices,
-    sessionStore: runs.sessionStore,
-    invoke: async () => ({ ok: true, data: {} }),
-    lifecycleOperationsLoader: loader,
-    req: { token: 't', command: 'close', session, positionals: [], flags: {} },
-    sessionName: session,
-    logPath: runs.logPath,
+async function openBootedByThisSession(runs: ReturnType<typeof createRoutedSession>) {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(CLOCK_START_MS);
+  const opened = await runs.run({
+    name: 'open',
+    flags: { platform: 'android' },
+    selectsDevice: true,
   });
-  return { response, finalizeAsks };
+  expect(opened.response?.ok).toBe(true);
+  const session = runs.sessionStore.get(SESSION);
+  // The boot fact and the instant of the boot it describes are written together, and that pair is
+  // the only thing close may compare against the device's own answer.
+  expect(session?.bootedByOpen).toBe(true);
+  return session?.bootedByOpenAtMs ?? CLOCK_START_MS;
 }
 
-function storedClaim(runs: Runs) {
-  return inspectDeviceClaims({ serial: BOOTED_EMULATOR.id }, runs.env)[0]?.claim;
-}
-
-/** Waits until the wall clock is past `instantMs`, so a boot epoch named here is already in the past. */
-async function elapsedSince(instantMs: number): Promise<void> {
-  while (Date.now() <= instantMs) {
-    await new Promise((resolve) => setTimeout(resolve, 2));
-  }
+function closeWarningMessages(response: { ok?: unknown; data?: unknown }): unknown {
+  if (!response.ok) throw new Error('expected a successful close');
+  return (response.data as { warnings?: string[] }).warnings;
 }
 
 beforeEach(() => {
@@ -195,70 +236,199 @@ beforeEach(() => {
   mockEnsureReadyRuntime.mockResolvedValue(undefined);
 });
 
-test('cold open boots the stopped AVD once, owns that boot, and claims the booted serial', async () => {
-  const runs = makeRuns();
-  await coldOpen(runs, 'external-reboot');
+test('plain close leaves an emulator rebooted outside the session running and says why', async () => {
+  const runs = createRoutedSession();
+  await openBootedByThisSession(runs);
 
-  const session = runs.sessionStore.get('external-reboot');
-  expect(session?.device.id).toBe(BOOTED_EMULATOR.id);
-  expect(session?.bootedByOpen).toBe(true);
+  // An outside actor restarts the emulator between two session commands. A reopen then proves the
+  // session cannot recover the boot fact from what it owns: the reopen boots nothing, and its own
+  // claim renewal vouches for the running device, so only the observed boot separates the boots.
+  vi.advanceTimersByTime(LATER_BOOT_DELAY_MS);
+  runs.boot.current = REBOOTED;
+  const reopened = await runs.run({ name: 'open', flags: { platform: 'android' } });
+  expect(reopened.response?.ok).toBe(true);
   expect(mockEnsureReadyRuntime).toHaveBeenCalledTimes(1);
-  const claim = storedClaim(runs);
-  expect(claim?.session).toBe('external-reboot');
-  expect(session?.deviceClaim?.ownerToken).toBe(claim?.ownerToken);
-});
+  expect(runs.sessionClaim().updatedAtMs).toBeGreaterThanOrEqual(LATER_BOOT_MS);
+  // The reopen claims the running device as its own, yet keeps the stamp of the boot it did not
+  // cause. That is what separates this session's boot from the outside one, and no claim timestamp
+  // can do it: renewal restamps `updatedAtMs` to vouch for the reboot, and `createdAtMs` can
+  // predate either.
+  expect(runs.sessionStore.get(SESSION)?.bootedByOpenAtMs).toBe(CLOCK_START_MS);
+  // Open and reopen settle their claims from the record alone, so neither has probed the device.
+  expect(runs.bootAsks()).toBe(0);
 
-test('plain close does not stop an emulator another actor rebooted before this session reopened', async () => {
-  const runs = makeRuns();
-  await coldOpen(runs, 'external-reboot');
-  const claimTakenAtMs = storedClaim(runs)?.createdAtMs ?? 0;
+  const closed = await runs.run({ name: 'close' });
 
-  // An outside actor stops and starts the same emulator: same serial, same claim file, new boot.
-  // Its boot epoch is a past instant that postdates this session's claim, which is what an
-  // `/proc/uptime` probe reports for an emulator that came back up between two session commands.
-  await elapsedSince(claimTakenAtMs);
-  const foreignBootMs = Date.now();
-  runs.boot.current = { observed: true, bootedAtMs: foreignBootMs };
-
-  const reopened = await reopenSession(runs, 'external-reboot');
-  expect(reopened?.ok).toBe(true);
-
-  // Result 1: this reopen booted nothing. It kept the same identity, claim and boot marker, and it
-  // vouched for the device again — after the foreign boot, so a renewal stamp cannot tell the two
-  // boots apart.
-  expect(mockEnsureReadyRuntime).toHaveBeenCalledTimes(1);
-  const session = runs.sessionStore.get('external-reboot');
-  expect(session?.device.id).toBe(BOOTED_EMULATOR.id);
-  expect(session?.bootedByOpen).toBe(true);
-  const claim = storedClaim(runs);
-  expect(claim?.ownerToken).toBe(session?.deviceClaim?.ownerToken);
-  expect(claim?.createdAtMs ?? 0).toBe(claimTakenAtMs);
-  expect((claim?.updatedAtMs ?? 0) >= foreignBootMs).toBe(true);
-
-  // Result 2: what plain close asks the platform to do with the CURRENT boot.
-  const { response, finalizeAsks } = await closeSession(runs, 'external-reboot');
-  expect(response?.ok).toBe(true);
-  expect(finalizeAsks).toEqual([{ shutdownTarget: false, retainRunner: false }]);
+  expect(closed.response?.ok).toBe(true);
+  expect(closed.finalizeAsks).toEqual([{ shutdownTarget: false, retainRunner: false }]);
   expect(mockShutdownTargetRuntime).not.toHaveBeenCalled();
-  if (response?.ok) expect(response.data?.shutdown).toBeUndefined();
-});
+  expect(closeWarningMessages(closed.response!)).toEqual([
+    "This session's open booted this device, but the device has been rebooted since then and close would stop that later boot, so it did not request a stop. The device is still running.",
+  ]);
+  if (closed.response?.ok) expect(closed.response.data).not.toHaveProperty('shutdown');
+  // Close asks the device once, and only once: the implicit stop's own decision.
+  expect(runs.bootAsks()).toBe(1);
+  vi.useRealTimers();
+}, 30_000);
 
-test('control: a same-boot reopen keeps plain close stopping the emulator this session booted', async () => {
-  const runs = makeRuns();
-  await coldOpen(runs, 'same-boot');
-  const ownBootMs = storedClaim(runs)?.createdAtMs ?? 0;
+test('plain close leaves an emulator rebooted outside the session running without any reopen', async () => {
+  const runs = createRoutedSession();
+  await openBootedByThisSession(runs);
 
-  // Identical case except the observed boot: the device still runs the boot this session caused.
+  runs.boot.current = REBOOTED;
+  const closed = await runs.run({ name: 'close' });
+
+  expect(closed.response?.ok).toBe(true);
+  expect(closed.finalizeAsks).toEqual([{ shutdownTarget: false, retainRunner: false }]);
+  expect(mockShutdownTargetRuntime).not.toHaveBeenCalled();
+  expect(closeWarningMessages(closed.response!)).toHaveLength(1);
+  vi.useRealTimers();
+}, 30_000);
+
+test('plain close stops the emulator this session booted while it still runs that boot', async () => {
+  const runs = createRoutedSession();
+  const ownBootMs = await openBootedByThisSession(runs);
+  expect(ownBootMs).toBe(CLOCK_START_MS);
+
+  // Same case except the boot the device reports: the one this session caused.
   runs.boot.current = { observed: true, bootedAtMs: ownBootMs };
+  const closed = await runs.run({ name: 'close' });
 
-  const reopened = await reopenSession(runs, 'same-boot');
-  expect(reopened?.ok).toBe(true);
-  expect(mockEnsureReadyRuntime).toHaveBeenCalledTimes(1);
-  expect(runs.sessionStore.get('same-boot')?.bootedByOpen).toBe(true);
-
-  const { response, finalizeAsks } = await closeSession(runs, 'same-boot');
-  expect(response?.ok).toBe(true);
-  expect(finalizeAsks).toEqual([{ shutdownTarget: true, retainRunner: false }]);
+  expect(closed.response?.ok).toBe(true);
+  expect(closed.finalizeAsks).toEqual([{ shutdownTarget: true, retainRunner: false }]);
   expect(mockShutdownTargetRuntime).toHaveBeenCalledTimes(1);
-  if (response?.ok) expect(response.data?.shutdown).toBeDefined();
-});
+  expect(closeWarningMessages(closed.response!)).toBeUndefined();
+  vi.useRealTimers();
+}, 30_000);
+
+test('plain close keeps the stop it owes when the emulator cannot report its current boot', async () => {
+  const runs = createRoutedSession();
+  await openBootedByThisSession(runs);
+
+  const closed = await runs.run({ name: 'close' });
+
+  expect(closed.response?.ok).toBe(true);
+  expect(closed.finalizeAsks).toEqual([{ shutdownTarget: true, retainRunner: false }]);
+  expect(mockShutdownTargetRuntime).toHaveBeenCalledTimes(1);
+  vi.useRealTimers();
+}, 30_000);
+
+test('plain close stops the emulator its own open booted even when the claim long predates that boot', async () => {
+  const runs = createRoutedSession();
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(CLOCK_START_MS);
+  // A previous session of this same name, workspace and daemon left its claim behind, so this
+  // session's open renews that claim instead of taking a new one. Its creation time belongs to the
+  // earlier session and describes nothing about the boot about to happen.
+  await runs.plantPriorClaim();
+  vi.advanceTimersByTime(PRIOR_CLAIM_GAP_MS);
+
+  const ownBootMs = CLOCK_START_MS + PRIOR_CLAIM_GAP_MS;
+  const opened = await runs.run({
+    name: 'open',
+    flags: { platform: 'android' },
+    selectsDevice: true,
+  });
+  expect(opened.response?.ok).toBe(true);
+  expect(runs.sessionStore.get(SESSION)?.bootedByOpen).toBe(true);
+  expect(runs.sessionClaim().createdAtMs).toBe(CLOCK_START_MS);
+
+  // The emulator reports the boot THIS open caused, which is what an uptime probe answers.
+  runs.boot.current = { observed: true, bootedAtMs: ownBootMs };
+  const closed = await runs.run({ name: 'close' });
+
+  // The session still owns the boot the device is running, so it still owes the stop.
+  expect(closed.response?.ok).toBe(true);
+  expect(closed.finalizeAsks).toEqual([{ shutdownTarget: true, retainRunner: false }]);
+  expect(mockShutdownTargetRuntime).toHaveBeenCalledTimes(1);
+  expect(closeWarningMessages(closed.response!)).toBeUndefined();
+  vi.useRealTimers();
+}, 30_000);
+
+test('close --shutdown stops a rebooted emulator and asks the device nothing', async () => {
+  const runs = createRoutedSession();
+  await openBootedByThisSession(runs);
+  runs.boot.current = REBOOTED;
+  const asksAfterOpen = runs.bootAsks();
+
+  const closed = await runs.run({ name: 'close', flags: { shutdown: true } });
+
+  expect(closed.response?.ok).toBe(true);
+  expect(closed.finalizeAsks).toEqual([{ shutdownTarget: true, retainRunner: false }]);
+  expect(mockShutdownTargetRuntime).toHaveBeenCalledTimes(1);
+  expect(runs.bootAsks()).toBe(asksAfterOpen);
+  expect(closeWarningMessages(closed.response!)).toBeUndefined();
+  vi.useRealTimers();
+}, 30_000);
+
+test('a close whose device cannot be probed still stops the emulator it booted and keeps its session', async () => {
+  const runs = createRoutedSession((device) =>
+    Promise.reject(new Error(`adb is gone: ${device.id}`)),
+  );
+  await openBootedByThisSession(runs);
+
+  const closed = await runs.run({ name: 'close' });
+
+  // A probe that cannot be asked is not evidence of anything, and it never becomes the reason a
+  // close fails: the stop the session owes is still owed, and nothing was half-torn down.
+  expect(closed.response?.ok).toBe(true);
+  expect(closed.finalizeAsks).toEqual([{ shutdownTarget: true, retainRunner: false }]);
+  expect(mockShutdownTargetRuntime).toHaveBeenCalledTimes(1);
+  expect(runs.sessionStore.get(SESSION)).toBeUndefined();
+  expect(closeWarningMessages(closed.response!)).toBeUndefined();
+  vi.useRealTimers();
+}, 30_000);
+
+test('close reaches no device or session step when it asks the boot observation', async () => {
+  const runs = createRoutedSession();
+  await openBootedByThisSession(runs);
+  runs.boot.current = REBOOTED;
+
+  const closed = await runs.run({ name: 'close' });
+
+  // The probe is the close's first step and the only one it adds: the lifecycle ask sees the
+  // decision it produced, and the session is retired as any successful close retires it.
+  expect(closed.finalizeAsks).toEqual([{ shutdownTarget: false, retainRunner: false }]);
+  expect(runs.bootAsks()).toBe(1);
+  expect(runs.sessionStore.get(SESSION)).toBeUndefined();
+  expect(runs.sessionClaimCount()).toBe(0);
+  vi.useRealTimers();
+}, 30_000);
+
+test('a policy refusal stays the reported reason when the emulator was rebooted as well', async () => {
+  const runs = createRoutedSession();
+  await openBootedByThisSession(runs);
+  runs.boot.current = REBOOTED;
+  const asksBeforeClose = runs.bootAsks();
+
+  const closed = await runs.run({ name: 'close', deviceShutdownDenied: true });
+
+  expect(closed.response?.ok).toBe(true);
+  expect(closed.finalizeAsks).toEqual([{ shutdownTarget: false, retainRunner: false }]);
+  expect(mockShutdownTargetRuntime).not.toHaveBeenCalled();
+  expect(closeWarningMessages(closed.response!)).toEqual([
+    "This session's open booted this device and close would stop it, but this daemon's policy denies device-shutdown. The device is still running.",
+  ]);
+  expect(runs.bootAsks()).toBe(asksBeforeClose);
+  vi.useRealTimers();
+}, 30_000);
+
+test('a lost claim stays the reported reason when the emulator was rebooted as well', async () => {
+  const runs = createRoutedSession();
+  await openBootedByThisSession(runs);
+  runs.boot.current = REBOOTED;
+  await runs.dropSessionClaim();
+  const asksBeforeClose = runs.bootAsks();
+
+  const closed = await runs.run({ name: 'close' });
+
+  expect(closed.response?.ok).toBe(true);
+  expect(closed.finalizeAsks).toEqual([{ shutdownTarget: false, retainRunner: false }]);
+  expect(mockShutdownTargetRuntime).not.toHaveBeenCalled();
+  expect(closeWarningMessages(closed.response!)).toEqual([
+    "This session's open booted this device, but close could not verify its device claim and did not request a stop.",
+  ]);
+  // Losing the claim settles the stop without reaching the device, so the reboot adds nothing.
+  expect(runs.bootAsks()).toBe(asksBeforeClose);
+  vi.useRealTimers();
+}, 30_000);

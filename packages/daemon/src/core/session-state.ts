@@ -181,6 +181,16 @@ export type SessionState = {
    * through `SessionStore.updateOpenDevice`; changing device identity clears it. Close only reads it.
    */
   bootedByOpen?: true;
+  /**
+   * #4585: the instant the boot in {@link bootedByOpen} was reported, on the host clock, and so the
+   * earliest instant the device this session booted can still be running. A plain close compares the
+   * boot the device reports for itself against this, which is what tells the boot this session
+   * caused from a boot somebody else caused afterwards. Nothing else carries this fact: the session's
+   * device claim may predate it, and a reopen vouches for whatever boot is already running. Written
+   * with the boot fact by `SessionStore.updateOpenDevice`, so the two can never disagree, and cleared
+   * with it. Close only reads it.
+   */
+  bootedByOpenAtMs?: number;
   createdAt: number;
   surface?: SessionSurface;
   appBundleId?: string;

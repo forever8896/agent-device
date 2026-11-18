@@ -112,6 +112,9 @@ export const STORE_OWNED_SESSION_STATE_FIELDS: ReadonlySet<string> = new Set([
   // Close only reads the fact; a replacement cannot inherit it.
   'device',
   'bootedByOpen',
+  // #4585: `SessionStore.updateOpenDevice` stamps when the boot above was reported, in the same
+  // write, so the fact and its instant cannot disagree. Close only reads the pair.
+  'bootedByOpenAtMs',
   // #4237: `close` marks a session it keeps through `SessionStore.markCloseEffectsUnconfirmed`.
   'closeEffectsUnconfirmed',
   'createdAt',
