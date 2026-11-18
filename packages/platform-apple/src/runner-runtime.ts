@@ -11,6 +11,7 @@ import {
 } from '@agent-device/apple-runner';
 import { Deadline } from '@agent-device/host-kit/retry';
 import { AppError } from '@agent-device/kernel/errors';
+import { unavailableFact } from '@agent-device/contracts/platform-runtime';
 import { readRunnerSessionLiveness, runAppleRunnerCommand } from './core/runner-client.ts';
 import type { DeviceInfo } from '@agent-device/kernel/device';
 import type { HostEnvironment } from '@agent-device/kernel/source-value';
@@ -35,6 +36,15 @@ import {
   type SnapshotRouter,
 } from '@agent-device/capture-kit/snapshot-router';
 import { createSystemSurfaceForegroundProbe } from './system-surface-foreground.ts';
+
+/**
+ * The shake is posted with simctl on the daemon host. A provider owns its simulator elsewhere and
+ * forwards runner commands only, so every provider-backed Apple device refuses it.
+ */
+const providerShakeUnavailable = unavailableFact(
+  'unsupported-provider-mode',
+  'shake posts through simctl on the daemon host; a provider-owned simulator has no shake control here.',
+);
 
 /** Binds a provider-owned runner session to the shared Apple command and runtime implementation. */
 export function createAppleRunnerRuntime(options: {
@@ -121,7 +131,7 @@ export function createAppleRunnerRuntime(options: {
     });
   };
   return {
-    facts: appleRunnerInteractionFacts(options.device),
+    facts: { ...appleRunnerInteractionFacts(options.device), shake: providerShakeUnavailable },
     bindDeployment: (
       request: Omit<Parameters<typeof createAppleAppDeploymentOperations>[0], 'device'>,
     ) => createAppleAppDeploymentOperations({ ...request, device: options.device }),

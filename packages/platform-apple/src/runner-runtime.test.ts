@@ -149,3 +149,15 @@ test('an observe-only capture on a provider Simulator still fails closed and nev
   ).rejects.toMatchObject({ code: 'UNSUPPORTED_OPERATION' });
   expect(commands).toHaveLength(0);
 });
+
+test('a provider-backed simulator refuses shake, which is posted by host simctl', () => {
+  const runner = createAppleRunnerRuntime({
+    device: IOS_SIMULATOR,
+    host: { env: {}, cwd: process.cwd() },
+    provider: { hasLiveSession: () => true, runCommand: async () => ({}) },
+  });
+  expect(runner.facts.shake).toMatchObject({
+    available: false,
+    reason: 'unsupported-provider-mode',
+  });
+});
