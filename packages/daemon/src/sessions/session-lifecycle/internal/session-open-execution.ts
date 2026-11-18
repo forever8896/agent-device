@@ -245,6 +245,7 @@ export async function completeOpenCommand(params: {
   /** The stale claim this open released before taking the device, when there was one. */
   tookOverDeviceClaim?: TakenOverDeviceClaim;
   selection?: DeviceSelectionResult;
+  bootedByOpenAtMs?: number;
 }): Promise<SessionOpenResult> {
   const {
     req,
@@ -286,6 +287,7 @@ export async function completeOpenCommand(params: {
     appName,
     existingRef,
     bootedByOpen: preparedSelection?.bootOccurred === true,
+    bootedByOpenAtMs: params.bootedByOpenAtMs,
   });
   if (provisionalSession.type === 'response') return provisionalSession;
   const openDispatchRef = provisionalSession.ref;
@@ -405,6 +407,7 @@ export async function completeOpenCommand(params: {
     appName,
     deviceClaim,
     bootedByOpen: preparedSelection?.bootOccurred === true,
+    bootedByOpenAtMs: params.bootedByOpenAtMs,
   });
   sessionStore.clearCloseEffectsUnconfirmed(nextRef);
   const nextSession = sessionStore.requireCurrent(nextRef);
@@ -439,13 +442,20 @@ async function prepareOpenDispatchSession(params: {
   appName: string | undefined;
   existingRef: SessionRef | undefined;
   bootedByOpen: boolean;
+  bootedByOpenAtMs: number | undefined;
 }): Promise<
   { type: 'session'; ref?: SessionRef } | { type: 'response'; response: DaemonResponse }
 > {
   const { req, sessionName, sessionStore, existingRef } = params;
   const beforeDispatch = req.internal?.openLifecycle?.beforeDispatch;
   if (!beforeDispatch) {
-    if (existingRef) sessionStore.updateOpenDevice(existingRef, params.device, params.bootedByOpen);
+    if (existingRef)
+      sessionStore.updateOpenDevice(
+        existingRef,
+        params.device,
+        params.bootedByOpen,
+        params.bootedByOpenAtMs,
+      );
     return { type: 'session', ref: existingRef };
   }
   const ref = publishOpenSession({
@@ -458,6 +468,7 @@ async function prepareOpenDispatchSession(params: {
     appBundleId: params.sessionAppBundleId,
     appName: params.appName,
     bootedByOpen: params.bootedByOpen,
+    bootedByOpenAtMs: params.bootedByOpenAtMs,
   });
   const lifecycleResponse = await beforeDispatch();
   if (lifecycleResponse && !lifecycleResponse.ok)
@@ -517,6 +528,7 @@ export async function openNewSessionWithDeviceClaim(params: {
   clearRuntimeHints?: RuntimeHintClearOperation;
   reconcileOrphanedDeviceClaim: DeviceClaimReconciler;
   selection?: DeviceSelectionResult;
+  bootedByOpenAtMs?: number;
   platformServices: DaemonPlatformServices;
 }): Promise<SessionOpenResult> {
   const {
@@ -616,6 +628,7 @@ export async function openNewSessionWithDeviceClaim(params: {
       deviceClaim,
       tookOverDeviceClaim,
       selection,
+      bootedByOpenAtMs: params.bootedByOpenAtMs,
     });
     if (!response.response.ok) await rollbackClaim();
     return response;

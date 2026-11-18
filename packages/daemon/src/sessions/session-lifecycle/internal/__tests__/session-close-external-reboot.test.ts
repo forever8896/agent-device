@@ -1,7 +1,7 @@
 // #4585: plain `close` owes a stop to the boot its own `open` caused, not to whichever boot the
 // device is running now. Routed through the session command handler, so claim acquisition, renewal,
 // boot stamping and close teardown all run against real claim files.
-import { beforeEach, expect, test, vi } from 'vitest';
+import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import path from 'node:path';
 import * as hostProcess from '@agent-device/host-kit/process';
 import {
@@ -112,6 +112,7 @@ function createRoutedSession(
     flags?: Record<string, unknown>;
     /** Only a cold open selects a device, and that selection is what boots the stopped AVD. */
     selectsDevice?: boolean;
+    beforeAppOpen?(): void;
     deviceShutdownDenied?: boolean;
   }) {
     if (command.selectsDevice) {
@@ -127,6 +128,10 @@ function createRoutedSession(
       const finalizeApplicationClose = operations.finalizeApplicationClose;
       return Object.freeze({
         ...operations,
+        openApplication: async (input) => {
+          command.beforeAppOpen?.();
+          return await operations.openApplication(input);
+        },
         finalizeApplicationClose: async (input) => {
           finalizeAsks.push({
             shutdownTarget: input.shutdownTarget === true,
@@ -208,20 +213,26 @@ function createRoutedSession(
  * Opens a stopped AVD through the cold route and leaves the emulator running on the boot this
  * session caused. The clock stays fake so a case can name a later boot instead of waiting one out.
  */
-async function openBootedByThisSession(runs: ReturnType<typeof createRoutedSession>) {
+async function openBootedByThisSession(
+  runs: ReturnType<typeof createRoutedSession>,
+  beforeAppOpen?: () => void,
+) {
   vi.useFakeTimers({ toFake: ['Date'] });
   vi.setSystemTime(CLOCK_START_MS);
   const opened = await runs.run({
     name: 'open',
     flags: { platform: 'android' },
     selectsDevice: true,
+    beforeAppOpen,
   });
   expect(opened.response?.ok).toBe(true);
   const session = runs.sessionStore.get(SESSION);
   // The boot fact and the instant of the boot it describes are written together, and that pair is
   // the only thing close may compare against the device's own answer.
   expect(session?.bootedByOpen).toBe(true);
-  return session?.bootedByOpenAtMs ?? CLOCK_START_MS;
+  const bootTime = session?.bootedByOpenAtMs;
+  if (bootTime === undefined) throw new Error('open did not record Android readiness time');
+  return bootTime;
 }
 
 function closeWarningMessages(response: { ok?: unknown; data?: unknown }): unknown {
@@ -234,6 +245,10 @@ beforeEach(() => {
   mockEnsureReadyRuntime.mockResolvedValue(undefined);
 });
 
+afterEach(() => {
+  vi.useRealTimers();
+});
+
 test('plain close leaves an emulator rebooted outside the session running and says why', async () => {
   const runs = createRoutedSession();
   await openBootedByThisSession(runs);
@@ -243,6 +258,9 @@ test('plain close leaves an emulator rebooted outside the session running and sa
   // claim renewal vouches for the running device, so only the observed boot separates the boots.
   vi.advanceTimersByTime(LATER_BOOT_DELAY_MS);
   runs.boot.current = REBOOTED;
+  const ref = runs.sessionStore.lookup(SESSION);
+  expect(ref).toBeDefined();
+  runs.sessionStore.updateOpenDevice(ref!, { ...BOOTED_EMULATOR, booted: false }, false);
   const reopened = await runs.run({ name: 'open', flags: { platform: 'android' } });
   expect(reopened.response?.ok).toBe(true);
   expect(mockEnsureReadyRuntime).toHaveBeenCalledTimes(1);
@@ -266,7 +284,6 @@ test('plain close leaves an emulator rebooted outside the session running and sa
   if (closed.response?.ok) expect(closed.response.data).not.toHaveProperty('shutdown');
   // Close asks the device once, and only once: the implicit stop's own decision.
   expect(runs.bootAsks()).toBe(1);
-  vi.useRealTimers();
 }, 30_000);
 
 test('plain close leaves an emulator rebooted outside the session running without any reopen', async () => {
@@ -280,8 +297,21 @@ test('plain close leaves an emulator rebooted outside the session running withou
   expect(closed.finalizeAsks).toEqual([{ shutdownTarget: false, retainRunner: false }]);
   expect(mockShutdownTargetRuntime).not.toHaveBeenCalled();
   expect(closeWarningMessages(closed.response!)).toHaveLength(1);
-  vi.useRealTimers();
 }, 30_000);
+
+test('plain close keeps a reboot that raced the first application launch', async () => {
+  const runs = createRoutedSession();
+  await openBootedByThisSession(runs, () => {
+    vi.advanceTimersByTime(LATER_BOOT_DELAY_MS);
+    runs.boot.current = REBOOTED;
+  });
+
+  const closed = await runs.run({ name: 'close' });
+
+  expect(closed.response?.ok).toBe(true);
+  expect(closed.finalizeAsks[0]?.shutdownTarget).toBe(false);
+  expect(closeWarningMessages(closed.response!)).toHaveLength(1);
+});
 
 test('plain close stops the emulator this session booted while it still runs that boot', async () => {
   const runs = createRoutedSession();
@@ -296,7 +326,6 @@ test('plain close stops the emulator this session booted while it still runs tha
   expect(closed.finalizeAsks).toEqual([{ shutdownTarget: true, retainRunner: false }]);
   expect(mockShutdownTargetRuntime).toHaveBeenCalledTimes(1);
   expect(closeWarningMessages(closed.response!)).toBeUndefined();
-  vi.useRealTimers();
 }, 30_000);
 
 test('plain close keeps the stop it owes when the emulator cannot report its current boot', async () => {
@@ -308,7 +337,6 @@ test('plain close keeps the stop it owes when the emulator cannot report its cur
   expect(closed.response?.ok).toBe(true);
   expect(closed.finalizeAsks).toEqual([{ shutdownTarget: true, retainRunner: false }]);
   expect(mockShutdownTargetRuntime).toHaveBeenCalledTimes(1);
-  vi.useRealTimers();
 }, 30_000);
 
 test('plain close stops the emulator its own open booted even when the claim long predates that boot', async () => {
@@ -340,7 +368,6 @@ test('plain close stops the emulator its own open booted even when the claim lon
   expect(closed.finalizeAsks).toEqual([{ shutdownTarget: true, retainRunner: false }]);
   expect(mockShutdownTargetRuntime).toHaveBeenCalledTimes(1);
   expect(closeWarningMessages(closed.response!)).toBeUndefined();
-  vi.useRealTimers();
 }, 30_000);
 
 test('close --shutdown stops a rebooted emulator and asks the device nothing', async () => {
@@ -356,7 +383,6 @@ test('close --shutdown stops a rebooted emulator and asks the device nothing', a
   expect(mockShutdownTargetRuntime).toHaveBeenCalledTimes(1);
   expect(runs.bootAsks()).toBe(asksAfterOpen);
   expect(closeWarningMessages(closed.response!)).toBeUndefined();
-  vi.useRealTimers();
 }, 30_000);
 
 test('a close whose device cannot be probed still stops the emulator it booted and keeps its session', async () => {
@@ -374,7 +400,6 @@ test('a close whose device cannot be probed still stops the emulator it booted a
   expect(mockShutdownTargetRuntime).toHaveBeenCalledTimes(1);
   expect(runs.sessionStore.get(SESSION)).toBeUndefined();
   expect(closeWarningMessages(closed.response!)).toBeUndefined();
-  vi.useRealTimers();
 }, 30_000);
 
 test('close reaches no device or session step when it asks the boot observation', async () => {
@@ -390,7 +415,6 @@ test('close reaches no device or session step when it asks the boot observation'
   expect(runs.bootAsks()).toBe(1);
   expect(runs.sessionStore.get(SESSION)).toBeUndefined();
   expect(runs.sessionClaimCount()).toBe(0);
-  vi.useRealTimers();
 }, 30_000);
 
 test('a policy refusal stays the reported reason when the emulator was rebooted as well', async () => {
@@ -408,7 +432,6 @@ test('a policy refusal stays the reported reason when the emulator was rebooted 
     "This session's open booted this device and close would stop it, but this daemon's policy denies device-shutdown. The device is still running.",
   ]);
   expect(runs.bootAsks()).toBe(asksBeforeClose);
-  vi.useRealTimers();
 }, 30_000);
 
 test('a lost claim stays the reported reason when the emulator was rebooted as well', async () => {
@@ -428,5 +451,4 @@ test('a lost claim stays the reported reason when the emulator was rebooted as w
   ]);
   // Losing the claim settles the stop without reaching the device, so the reboot adds nothing.
   expect(runs.bootAsks()).toBe(asksBeforeClose);
-  vi.useRealTimers();
 }, 30_000);

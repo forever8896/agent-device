@@ -35,7 +35,7 @@ export type PlatformCloseDispatcher = (params: {
 }) => Promise<unknown>;
 
 /** The stop one close owes its device, and the reason it reports when it owes none. */
-export type CloseDeviceStopDecision = Readonly<{
+type CloseDeviceStopDecision = Readonly<{
   shutdownRequested: boolean;
   /**
    * #4162: the close owned stopping the device its own `open` booted, and this daemon's policy

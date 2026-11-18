@@ -33,6 +33,7 @@ export function publishOpenSession(params: {
   deviceClaim?: DeviceClaimSessionOwnership;
   /** #4162: this open booted the local virtual device, so its plain close owns stopping it. */
   bootedByOpen?: boolean;
+  bootedByOpenAtMs?: number;
 }): SessionRef {
   const {
     req,
@@ -48,7 +49,7 @@ export function publishOpenSession(params: {
   } = params;
   requireOpenSessionAdmission(store, sessionName, existingRef);
   if (existingRef) {
-    store.updateOpenDevice(existingRef, device, bootedByOpen === true);
+    store.updateOpenDevice(existingRef, device, bootedByOpen === true, params.bootedByOpenAtMs);
     const session = store.update(existingRef, {
       surface,
       appBundleId,
@@ -72,6 +73,6 @@ export function publishOpenSession(params: {
     deviceClaim,
   };
   const ref = store.publish(sessionName, draft);
-  if (bootedByOpen === true) store.updateOpenDevice(ref, device, true);
+  if (bootedByOpen === true) store.updateOpenDevice(ref, device, true, params.bootedByOpenAtMs);
   return store.refresh(ref);
 }

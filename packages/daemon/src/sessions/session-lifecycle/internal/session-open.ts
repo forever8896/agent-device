@@ -419,6 +419,7 @@ async function handleOpenCommand(params: SessionOpenCommandInput): Promise<Sessi
     env: params.host.env,
     deadlineAtMs: startupDeadline,
   });
+  const bootedByOpenAtMs = booted ? Date.now() : undefined;
   const selection = booted ? { ...markSelectionBootOccurred(resolved), device: booted } : resolved;
   const device = selection.device;
   if (booted) {
@@ -450,6 +451,7 @@ async function handleOpenCommand(params: SessionOpenCommandInput): Promise<Sessi
         reconcileOrphanedDeviceClaim: params.reconcileOrphanedDeviceClaim,
         platformServices: params.platformServices,
         selection,
+        bootedByOpenAtMs,
       }),
   );
 }
