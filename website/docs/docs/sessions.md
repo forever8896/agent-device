@@ -126,6 +126,9 @@ agent-device open --platform ios --device iPhone_17_Pro
 agent-device close            # the simulator this open booted ends shut down
 ```
 
+If a local Android emulator reports a boot newer than the one the session started,
+plain `close` leaves it running and reports why in `warnings`.
+
 Add `--shutdown` to explicitly stop a local simulator or emulator regardless of boot ownership.
 Physical devices are not stopped. Provider sessions follow the provider's shutdown action.
 With [Limrun](./limrun.md), `--shutdown` ends the instance or attachment and can delete an instance

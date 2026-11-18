@@ -1,4 +1,5 @@
 import type { LeaseRegistry } from '../../../resources/lease-registry.ts';
+import { isAndroidEmulator } from '../../device/device-targets.ts';
 import { inspectSessionLeaseRetainedOnClose } from '../../lease-lifecycle.ts';
 import type { CloseApplicationFinalizationResult } from '@agent-device/contracts/application-lifecycle-runtime';
 import type { TargetShutdownResult } from '@agent-device/contracts/device';
@@ -72,7 +73,13 @@ async function deviceRebootedSinceSessionBoot(params: {
   bootedByOpenAtMs: number | undefined;
   observeDeviceBoot: DeviceBootObservationService | undefined;
 }): Promise<boolean> {
-  if (!params.observeDeviceBoot || params.bootedByOpenAtMs === undefined) return false;
+  if (
+    !isAndroidEmulator(params.device) ||
+    !params.observeDeviceBoot ||
+    params.bootedByOpenAtMs === undefined
+  ) {
+    return false;
+  }
   const observation = await params.observeDeviceBoot
     .observeBootTimeMs(params.device)
     .catch((): DeviceBootObservation => ({ observed: false, reason: 'unobserved' }));
