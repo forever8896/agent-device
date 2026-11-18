@@ -17,15 +17,23 @@ import {
   clearRequestAbortRegistration,
 } from '@agent-device/host-kit/request';
 
-test.each([false, true])(
-  'a prepared cold reopen owns its boot before dispatch (fails: %s)',
-  async (fails) => {
+test.each([
+  { fails: false, priorBoot: undefined },
+  { fails: true, priorBoot: undefined },
+  { fails: false, priorBoot: true },
+  { fails: true, priorBoot: true },
+] as const)(
+  'reopen preserves boot ownership with a stale device snapshot (fails: $fails, owned: $priorBoot)',
+  async ({ fails, priorBoot }) => {
     const store = makeSessionStore();
     const device = { ...makeAndroidEmulator(), booted: false };
-    const ref = store.publish('reopen', makeSession('reopen', device));
+    const ref = store.publish('reopen', {
+      ...makeSession('reopen', device),
+      bootedByOpen: priorBoot,
+    });
     const { loader } = lifecycleOperationsSpy({
       openApplication: async () => {
-        expect(store.requireCurrent(ref).bootedByOpen).toBe(true);
+        expect(store.requireCurrent(ref).bootedByOpen).toBe(priorBoot);
         if (fails) throw new AppError('COMMAND_FAILED', 'Launch rejected');
         return { timing: {} };
       },
@@ -45,7 +53,7 @@ test.each([false, true])(
     });
     if (fails) await expect(pending).rejects.toThrow('Launch rejected');
     else expect((await pending).type).toBe('opened');
-    expect(store.requireCurrent(ref).bootedByOpen).toBe(true);
+    expect(store.requireCurrent(ref).bootedByOpen).toBe(priorBoot);
   },
 );
 

@@ -324,8 +324,6 @@ async function handleOpenCommand(params: SessionOpenCommandInput): Promise<Sessi
     });
     if (details.type === 'response') return { type: 'response', response: details.response };
 
-    // Preparation may have booted the device to reach this surface, and a boot an owner caused for
-    // its own reopen cannot later read as a boot its owner walked away from.
     requireOpenSessionAdmission(sessionStore, sessionName, existingRef);
     const reclaimed = await renewOpenSessionClaim(
       device,

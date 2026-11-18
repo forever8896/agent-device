@@ -101,7 +101,7 @@ export function resolveExistingSessionDeviceSelection(device: DeviceInfo): Devic
 
 /**
  * Classifies the boot obligation for a stopped local virtual target before open dispatch.
- * Provider and physical targets never claim a daemon-owned boot.
+ * An existing session snapshot does not establish a new boot.
  */
 export function markSelectionBootOccurred(
   selection: DeviceSelectionResult,
@@ -115,7 +115,7 @@ export function markSelectionBootOccurred(
   selection: DeviceSelectionResult | undefined,
   localPreparation = selection?.source === 'local',
 ): DeviceSelectionResult | undefined {
-  if (!selection || !localPreparation || selection.source === 'provider') return selection;
+  if (!selection || !localPreparation || selection.source !== 'local') return selection;
   const { device } = selection;
   const bootedByThisOpen =
     device.booted !== true && (device.kind === 'simulator' || device.kind === 'emulator');
