@@ -24,3 +24,12 @@ export const deviceBootObservation: DeviceBootObservationService = Object.freeze
     return { observed: false, reason: 'unsupported-device' };
   },
 });
+
+export async function observeBootTimeForImplicitShutdown(
+  device: DeviceInfo,
+): Promise<DeviceBootObservation> {
+  if (device.platform !== 'android' || device.kind !== 'emulator') {
+    return { observed: false, reason: 'unsupported-device' };
+  }
+  return await deviceBootObservation.observeBootTimeMs(device);
+}

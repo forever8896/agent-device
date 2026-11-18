@@ -1,5 +1,4 @@
 import type { LeaseRegistry } from '../../../resources/lease-registry.ts';
-import { isAndroidEmulator } from '../../device/device-targets.ts';
 import { inspectSessionLeaseRetainedOnClose } from '../../lease-lifecycle.ts';
 import type { CloseApplicationFinalizationResult } from '@agent-device/contracts/application-lifecycle-runtime';
 import type { TargetShutdownResult } from '@agent-device/contracts/device';
@@ -71,17 +70,11 @@ export type SessionCloseTeardownResult = Readonly<{
 async function deviceRebootedSinceSessionBoot(params: {
   device: DeviceInfo;
   bootedByOpenAtMs: number | undefined;
-  observeDeviceBoot: DeviceBootObservationService | undefined;
+  observeDeviceBoot: DeviceBootObservationService['observeBootTimeMs'] | undefined;
 }): Promise<boolean> {
-  if (
-    !isAndroidEmulator(params.device) ||
-    !params.observeDeviceBoot ||
-    params.bootedByOpenAtMs === undefined
-  ) {
-    return false;
-  }
-  const observation = await params.observeDeviceBoot
-    .observeBootTimeMs(params.device)
+  if (!params.observeDeviceBoot || params.bootedByOpenAtMs === undefined) return false;
+  const observation = await params
+    .observeDeviceBoot(params.device)
     .catch((): DeviceBootObservation => ({ observed: false, reason: 'unobserved' }));
   return observation.observed && observation.bootedAtMs > params.bootedByOpenAtMs;
 }
@@ -105,7 +98,7 @@ async function decideDeviceStopOnClose(params: {
   session: SessionState;
   localFamily: boolean;
   deviceShutdownDenied: boolean;
-  observeDeviceBoot: DeviceBootObservationService | undefined;
+  observeDeviceBoot: DeviceBootObservationService['observeBootTimeMs'] | undefined;
 }): Promise<CloseDeviceStopDecision> {
   const { session } = params;
   const implicitShutdown =
@@ -166,7 +159,7 @@ export async function runSessionCloseTeardown(params: {
    * cannot read the device, arrives as `unobserved` and keeps that decision; only an observed boot
    * later than this session's own moves it.
    */
-  observeDeviceBoot?: DeviceBootObservationService;
+  observeDeviceBoot?: DeviceBootObservationService['observeBootTimeMs'];
 }): Promise<SessionCloseTeardownResult> {
   const {
     req,

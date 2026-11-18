@@ -83,30 +83,24 @@ const BOOTED_EMULATOR: DeviceInfo = {
 
 function createRoutedSession(
   observeBootTimeMs?: (device: DeviceInfo) => Promise<DeviceBootObservation>,
-  devices: { stopped: DeviceInfo; ready: DeviceInfo } = {
-    stopped: STOPPED_AVD,
-    ready: BOOTED_EMULATOR,
-  },
 ) {
   const stateDir = mkdtempForTestSync('agent-device-session-close-reboot-');
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     AGENT_DEVICE_CLAIMS_DIR: path.join(stateDir, 'claims'),
   };
-  // The composed boot-observation service is the one root composition hands the claim owner and
-  // close alike; its answer is the only fact a case changes. While the emulator is stopped the host
-  // reports no boot epoch for its serial, so the cold open's boot is the first answer.
+  // The close-specific platform port supplies the emulator's observed boot time.
   const boot: { current: DeviceBootObservation } = {
     current: { observed: false, reason: 'unobserved' },
   };
   let bootAsks = 0;
   const platformServices = daemonPlatformServicesFixture({
-    deviceBootObservation: Object.freeze({
-      observeBootTimeMs: async (device: DeviceInfo): Promise<DeviceBootObservation> => {
-        bootAsks += 1;
-        return (await observeBootTimeMs?.(device)) ?? boot.current;
-      },
-    }),
+    observeBootTimeForImplicitShutdown: async (
+      device: DeviceInfo,
+    ): Promise<DeviceBootObservation> => {
+      bootAsks += 1;
+      return (await observeBootTimeMs?.(device)) ?? boot.current;
+    },
   }) as unknown as DaemonPlatformServices;
   const sessionStore = new SessionStore(path.join(stateDir, 'sessions'), {
     env,
@@ -121,8 +115,8 @@ function createRoutedSession(
     deviceShutdownDenied?: boolean;
   }) {
     if (command.selectsDevice) {
-      vi.mocked(resolveTargetDevice).mockResolvedValue(devices.stopped);
-      mockEnsureReadyRuntime.mockResolvedValue(devices.ready);
+      vi.mocked(resolveTargetDevice).mockResolvedValue(STOPPED_AVD);
+      mockEnsureReadyRuntime.mockResolvedValue(BOOTED_EMULATOR);
     }
     // Plain close is recorded at the lifecycle port the close dispatches, and the leaf
     // `shutdownTarget` stays the harness's own, so `mockShutdownTargetRuntime` counts the stop the
@@ -166,14 +160,14 @@ function createRoutedSession(
   }
 
   function sessionClaim() {
-    const claim = inspectDeviceClaims({ serial: devices.ready.id }, env)[0]?.claim;
+    const claim = inspectDeviceClaims({ serial: BOOTED_EMULATOR.id }, env)[0]?.claim;
     if (!claim) throw new Error('expected the session to hold its claim');
     return claim;
   }
 
   /** Claims on disk for this case's device, which a successful close releases with the session. */
   function sessionClaimCount() {
-    return inspectDeviceClaims({ serial: devices.ready.id }, env).length;
+    return inspectDeviceClaims({ serial: BOOTED_EMULATOR.id }, env).length;
   }
 
   /**
@@ -183,7 +177,7 @@ function createRoutedSession(
    */
   async function plantPriorClaim() {
     const acquired = await acquireDeviceClaim({
-      device: devices.ready,
+      device: BOOTED_EMULATOR,
       session: SESSION,
       workspace: process.cwd(),
       stateDir: sessionStore.resolveDaemonStateDir(),
@@ -274,41 +268,6 @@ test('plain close leaves an emulator rebooted outside the session running and sa
   expect(runs.bootAsks()).toBe(1);
   vi.useRealTimers();
 }, 30_000);
-
-test('plain close stops an iOS simulator it booted without probing its boot time', async () => {
-  const stopped: DeviceInfo = {
-    platform: 'apple',
-    appleOs: 'ios',
-    id: 'simulator-reboot-scope',
-    name: 'iPhone 15',
-    kind: 'simulator',
-    booted: false,
-  };
-  const runs = createRoutedSession(async () => REBOOTED, {
-    stopped,
-    ready: { ...stopped, booted: true },
-  });
-  vi.useFakeTimers({ toFake: ['Date'] });
-  vi.setSystemTime(CLOCK_START_MS);
-  try {
-    const opened = await runs.run({
-      name: 'open',
-      flags: { platform: 'ios' },
-      selectsDevice: true,
-    });
-    expect(opened.response?.ok).toBe(true);
-    expect(runs.sessionStore.get(SESSION)?.bootedByOpen).toBe(true);
-    vi.advanceTimersByTime(LATER_BOOT_DELAY_MS);
-
-    const closed = await runs.run({ name: 'close' });
-
-    expect(closed.response?.ok).toBe(true);
-    expect(closed.finalizeAsks[0]?.shutdownTarget).toBe(true);
-    expect(runs.bootAsks()).toBe(0);
-  } finally {
-    vi.useRealTimers();
-  }
-});
 
 test('plain close leaves an emulator rebooted outside the session running without any reopen', async () => {
   const runs = createRoutedSession();
