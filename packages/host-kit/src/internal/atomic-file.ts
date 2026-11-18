@@ -675,6 +675,287 @@ function createMissingLevel(
   return level;
 }
 
+/* ---------------------------------------------------------------------------
+ * The daemon's own state directory (#4649).
+ *
+ * A destination a caller names is the caller's own, and `prepareScriptDestination` judges it. A state
+ * directory is the opposite case: the daemon picked it and writes into it without being asked, so the
+ * daemon OWNS it, and everything below it is judged by the one rule below. State creation, repair, and
+ * the answer a state-diagnostic writer gets before it writes all come from here, so the three cannot
+ * disagree.
+ *
+ * Two points stricter than the destination rule, because nothing here is chosen by a caller. No level is
+ * entered through a link, so no spelling below one can leave the tree, and the rule never has to reason
+ * about a link another local user could swap. And the levels ABOVE the state directory are neither
+ * judged nor repaired: the daemon does not choose them, and a home directory is nobody's to tighten.
+ * ------------------------------------------------------------------------- */
+
+/** What a caller may do with one state chain, and the ground it was judged on. */
+export type PrivateDirectoryChain = Readonly<{
+  /** The PHYSICAL directory to create the entry in, never the caller's spelling. */
+  directory: string;
+  /** Why the chain is not private, or `undefined` when it is. */
+  exposure: PrivateDirectoryExposure | undefined;
+}>;
+
+/** The ways a state chain fails the rule; {@link privateDirectoryWordingOf} words each one. */
+export type PrivateDirectoryExposure =
+  | 'not_a_directory'
+  | 'planted_link'
+  | 'foreign_owned'
+  | 'shared_writable'
+  | 'unreachable'
+  | 'outside_state_dir';
+
+/**
+ * Establishes a private chain under `stateDir`, creating what is missing, and answers typed.
+ *
+ * Repair never decides whether a process starts: a level another user owns is left alone and reported,
+ * and a filesystem that will not carry a mode is a skip with a diagnostic. A refusal before creation
+ * leaves nothing behind.
+ */
+export function ensurePrivateDirectoryChain(
+  stateDir: string,
+  names: readonly string[] = [],
+): PrivateDirectoryChain {
+  const spelled = spelledStateChain(stateDir, names);
+  if (spelled === undefined) return { directory: stateDir, exposure: 'outside_state_dir' };
+  if (process.platform === 'win32') {
+    // Access is an ACL here, so no walk runs and `lstat` answers no usable directory identity. One
+    // recursive `mkdir` is what this host has always done: it forces nothing on a level that stands.
+    return createStateDirectory(spelled.target);
+  }
+  const trust = scriptTrust();
+  // Creating is the one moment ground below this call's feet changes, so a chain it completed is judged
+  // again from the state directory, the way the walk re-judges after `createMissingLevels`.
+  const arrived = walkStateChain(spelled, trust, true);
+  return arrived.exposure === undefined ? walkStateChain(spelled, trust, false) : arrived;
+}
+
+/**
+ * Judges a chain that must already stand, creating and repairing nothing. This is what a writer of a
+ * state diagnostic asks before it opens a file: an `exposure` says the chain is not this process's own to
+ * write into, and the writer skips its file rather than write through ground another local user controls.
+ */
+export function judgePrivateDirectoryChain(
+  stateDir: string,
+  names: readonly string[] = [],
+): PrivateDirectoryChain {
+  const spelled = spelledStateChain(stateDir, names);
+  if (spelled === undefined) return { directory: stateDir, exposure: 'outside_state_dir' };
+  if (process.platform === 'win32') return { directory: spelled.target, exposure: undefined };
+  return walkStateChain(spelled, scriptTrust(), false);
+}
+
+/**
+ * Where the chain stands and what it is spelled from: `root` is the state directory and `target` its
+ * deepest level, both absolute and free of `.` and `..`.
+ */
+type SpelledStateChain = Readonly<{ root: string; target: string }>;
+
+/**
+ * The chain's spelling, refused when there is none.
+ *
+ * A `..` has no answer here. Folding one away is what sends a state path OUTSIDE the state directory
+ * through a link, and the writer would then be told about a directory it never named. `spelledStateChain`
+ * is where that is decided once, before any lookups.
+ */
+function spelledStateChain(
+  stateDir: string,
+  names: readonly string[],
+): SpelledStateChain | undefined {
+  if (!path.isAbsolute(stateDir)) return undefined;
+  if (stateDir.split(/[\\/]/).includes('..')) return undefined;
+  const oneName = (name: string): boolean =>
+    name.length > 0 && name !== '.' && name !== '..' && !name.includes('/') && !name.includes('\\');
+  if (!names.every(oneName)) return undefined;
+  const root = path.resolve(stateDir);
+  return { root, target: path.join(root, ...names) };
+}
+
+/**
+ * Walks the chain from the state directory down, judging every level by this call's own `lstat` of the
+ * NAME. With `create`, a missing level is made at 0700 inside the level the walk just judged, one name at
+ * a time; a name that arrived since the look is judged by the same rule, because two processes starting
+ * on one state directory meet at that entry. Without it, an absent level is `unreachable` and nothing is
+ * created.
+ */
+function walkStateChain(
+  spelled: SpelledStateChain,
+  trust: ScriptDestinationTrust,
+  create: boolean,
+): PrivateDirectoryChain {
+  let stood = standOnStateDir(spelled.root, trust, create);
+  if (stood.exposure !== undefined) return { directory: spelled.root, exposure: stood.exposure };
+  for (const name of stateNamesBelow(spelled)) {
+    const level = path.join(stood.directory, name);
+    const seen = lstatEntry(level);
+    if (seen === undefined) {
+      if (!create) return { directory: level, exposure: 'unreachable' };
+      const made = createStateLevel(level);
+      if (made.exposure !== undefined) return made;
+      const judged = judgeStateLevel(level, lstatEntry(level), trust);
+      if (judged.exposure !== undefined) return judged;
+      stood = judged;
+      continue;
+    }
+    const judged = judgeStateLevel(level, seen, trust, create);
+    if (judged.exposure !== undefined) return judged;
+    stood = judged;
+  }
+  return stood;
+}
+
+/**
+ * Stands on the state directory itself, creating it when `create` allows.
+ *
+ * A missing state directory is made with one RECURSIVE `mkdir`, which is also what fills in any missing
+ * ANCESTOR: the default state dir sits below `$HOME/.agent-device/dev` and nothing else creates those.
+ * Those ancestors are above the chain this rule owns, so they are neither judged nor repaired.
+ */
+function standOnStateDir(
+  root: string,
+  trust: ScriptDestinationTrust,
+  create: boolean,
+): PrivateDirectoryChain {
+  const seen = lstatEntry(root);
+  if (seen !== undefined) return judgeStateLevel(root, seen, trust, create);
+  if (!create) return { directory: root, exposure: 'unreachable' };
+  const made = createStateDirectory(root);
+  return made.exposure === undefined ? judgeStateLevel(root, lstatEntry(root), trust) : made;
+}
+
+/** Creates the state directory and its missing ancestors, answering typed like the walk does. */
+function createStateDirectory(root: string): PrivateDirectoryChain {
+  try {
+    fs.mkdirSync(root, { recursive: true, mode: SCRIPT_DIR_MODE });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return {
+      directory: path.dirname(root),
+      exposure: code === 'ENOENT' ? 'unreachable' : 'not_a_directory',
+    };
+  }
+  // `mkdir` ANDs its mode with the umask, so the exact mode is SAID again once the entry exists: the
+  // umask of a shared checkout cannot leave the daemon's own state directory narrower or looser.
+  repairPrivateMode(root, SCRIPT_DIR_MODE);
+  return { directory: root, exposure: undefined };
+}
+
+/** Creates one missing level at 0700 INSIDE the level the walk just judged, never through a link. */
+function createStateLevel(level: string): PrivateDirectoryChain {
+  try {
+    fs.mkdirSync(level, { mode: SCRIPT_DIR_MODE });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+      return { directory: path.dirname(level), exposure: 'unreachable' };
+    }
+    // The name arrived beside this call. Whatever it is, it is judged by the same rule below, and this
+    // call never changes a mode it did not create.
+    return { directory: level, exposure: undefined };
+  }
+  repairPrivateMode(level, SCRIPT_DIR_MODE);
+  return { directory: level, exposure: undefined };
+}
+
+/** The names the chain walks through below the state directory, shallowest first. */
+function stateNamesBelow(spelled: SpelledStateChain): string[] {
+  const below = path.relative(spelled.root, spelled.target);
+  return below === '' ? [] : below.split(path.sep);
+}
+
+/**
+ * The judgment one level earns, and the repair it earns first.
+ *
+ * A level this user owns that stands at any other mode is brought to {@link SCRIPT_DIR_MODE} before it is
+ * judged, whenever the caller is establishing the chain: the shared checkout's umask 002 leaves a
+ * mode-less `mkdir` at 0775, and a state directory a host left loose gets narrowed. A level root owns is
+ * judged as it stands and never touched, and a level another user owns is refused without being touched:
+ * tightening somebody else's directory is not this rule's to do.
+ */
+function judgeStateLevel(
+  level: string,
+  stats: fs.BigIntStats | undefined,
+  trust: ScriptDestinationTrust,
+  repair = false,
+): PrivateDirectoryChain {
+  if (stats === undefined) return { directory: level, exposure: 'unreachable' };
+  if (stats.isSymbolicLink()) return { directory: level, exposure: 'planted_link' };
+  if (!stats.isDirectory()) return { directory: level, exposure: 'not_a_directory' };
+  const authority = directoryAuthority(stats);
+  if (authority.uid !== 0 && authority.uid !== trust.uid) {
+    return { directory: level, exposure: 'foreign_owned' };
+  }
+  if (repair && authority.uid === trust.uid && (authority.mode & 0o777) !== SCRIPT_DIR_MODE) {
+    repairPrivateMode(level, SCRIPT_DIR_MODE);
+    return judgeStateLevel(level, lstatEntry(level), trust);
+  }
+  if (otherUsersWriteTo(authority)) {
+    return { directory: level, exposure: 'shared_writable' };
+  }
+  return { directory: level, exposure: undefined };
+}
+
+/**
+ * A level whose group or world can write is open to other local users, whoever owns it and whether or not
+ * a sticky bit stands on it.
+ *
+ * This is deliberately stricter than {@link othersCreateEntriesIn}, which the destination rule uses and
+ * which lets a STICKY shared directory pass. Passing THROUGH one is safe there, because another user
+ * cannot replace an entry the daemon made. Here the daemon creates names of its own choosing in the
+ * level, so another local user can win the race to plant a link at `daemon-shutdown.json` or at a
+ * marker's name first, and a sticky bit does not stop that: it only stops them replacing an entry they do
+ * not own. The group bit counts because the group of a daemon-made directory is the daemon user's own
+ * group, whose other members can add a name. Read and traverse bits are not this rule's concern: they
+ * decide what another user can see, and the daemon's state files carry their own modes for that.
+ */
+function otherUsersWriteTo(authority: DirectoryAuthority): boolean {
+  return (authority.mode & 0o022) !== 0;
+}
+
+/**
+ * Forces `target` to the exact private `mode` it is asked for.
+ *
+ * The repair never decides an outcome, so EVERY failure is a skip with a diagnostic: a filesystem or a
+ * host that cannot carry a mode, a path that went away, and a mount that refuses it are all ground the
+ * judgment still reads as it stands. On Windows `chmod` only toggles the read-only bit, so it cannot make
+ * a path private and no caller reaches here on that host.
+ */
+export function repairPrivateMode(target: string, mode: number): void {
+  try {
+    fs.chmodSync(target, mode);
+  } catch (error) {
+    emitDiagnostic({
+      level: 'warn',
+      phase: 'daemon_state_mode_repair_skipped',
+      data: {
+        path: target,
+        error: error instanceof Error ? error.message : String(error),
+      },
+    });
+  }
+}
+
+/** The typed reason a state-chain refusal answers with, named once for whoever reads it. */
+export const PRIVATE_STATE_DIR_REASON = 'state_dir_untrusted';
+
+/** Why each exposure makes that ground unsafe, in the caller's terms. */
+const privateDirectoryWording: Record<PrivateDirectoryExposure, string> = {
+  not_a_directory: 'a directory was expected there, and something else stands in the way.',
+  planted_link:
+    'a symbolic link stands in the way, so what would be written there is not inside the state directory.',
+  foreign_owned: 'another local user owns that part of the state path.',
+  shared_writable: 'another local user can add an entry to that part of the state path.',
+  unreachable:
+    'that part of the state path is not there and cannot be created there, so nothing has a place to be written.',
+  outside_state_dir:
+    'the state path steps out of the directory it starts in, so where it lands is not established.',
+};
+
+export function privateDirectoryWordingOf(exposure: PrivateDirectoryExposure): string {
+  return privateDirectoryWording[exposure];
+}
+
 function assertSafeDestination(destination: string): void {
   const stats = lstatIfPresent(destination);
   if (stats?.isSymbolicLink()) {

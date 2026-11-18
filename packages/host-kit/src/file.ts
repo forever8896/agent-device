@@ -1,5 +1,10 @@
 export {
   confirmScriptDestination,
+  ensurePrivateDirectoryChain,
+  judgePrivateDirectoryChain,
+  privateDirectoryWordingOf,
+  PRIVATE_STATE_DIR_REASON,
+  repairPrivateMode,
   isAtomicPublishTemporaryPath,
   prepareScriptDestination,
   publishDurableFileSync,
@@ -7,6 +12,8 @@ export {
   publishScriptFileSync,
   scriptAncestryReason,
   type DurableFilePublishMode,
+  type PrivateDirectoryChain,
+  type PrivateDirectoryExposure,
   type ScriptDestination,
 } from './internal/atomic-file.ts';
 export {

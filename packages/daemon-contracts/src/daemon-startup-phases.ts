@@ -29,7 +29,16 @@ export function resolveDaemonStartupPhasesPath(stateDir: string, pid: number): s
   return path.join(stateDir, `daemon-startup-phases-${pid}.jsonl`);
 }
 
-/** Appends one phase marker; a refused append goes to `reportFailure`, never fatal to a startup. */
+/**
+ * Appends one phase marker; a refused append goes to `reportFailure`, never fatal to a startup.
+ *
+ * The marker's directory is the daemon's own state directory, which `launchDaemonProcess` establishes
+ * at 0700 before this process exists; the `mkdir` here is the same claim spelled the same way, for a
+ * daemon started without that launcher. What is still this call's to decide is the FINAL NAME: another
+ * local user who can write that directory can plant a link at it, and an append would land in whatever
+ * it points at. So the entry is opened only as a regular file, reached without following that link, and
+ * created at 0600, the mode a state diagnostic carries.
+ */
 export function recordDaemonStartupMarker(
   startupPhasesPath: string,
   phase: DaemonStartupPhase,
@@ -37,31 +46,108 @@ export function recordDaemonStartupMarker(
 ): void {
   try {
     const timestampMs = Date.now();
-    fs.mkdirSync(path.dirname(startupPhasesPath), { recursive: true });
-    // A crash mid-append can leave no trailing newline; glue two appends and both are lost.
-    const separator = endsWithoutNewline(startupPhasesPath) ? '\n' : '';
-    fs.appendFileSync(
+    fs.mkdirSync(path.dirname(startupPhasesPath), { recursive: true, mode: PRIVATE_DIR_MODE });
+    appendMarkerLine(
       startupPhasesPath,
-      `${separator}${JSON.stringify({ data: { startupPhase: phase, timestampMs } })}\n`,
+      `${JSON.stringify({ data: { startupPhase: phase, timestampMs } })}\n`,
     );
   } catch (error) {
     reportFailure?.(normalizeError(error));
   }
 }
 
-function endsWithoutNewline(file: string): boolean {
-  let fd: number | undefined;
+const PRIVATE_DIR_MODE = 0o700;
+
+/**
+ * Appends through one descriptor that names a regular file, or refuses.
+ *
+ * `O_NOFOLLOW` is what makes the refusal mean something: without it the kernel resolves the final name
+ * and an append lands in whatever a link there points at. The glue a crashed append needs is read
+ * THROUGH THAT SAME DESCRIPTOR, so nothing is read at the name either. `lstat` judges the entry, the
+ * descriptor is checked against that identity, and the file opened is the file judged.
+ * `O_NOFOLLOW` is absent on Windows, where a directory link is a privileged operation this threat model
+ * excludes; the regular-file check still runs there.
+ */
+function appendMarkerLine(startupPhasesPath: string, line: string): void {
+  const descriptor = openMarkerForAppend(startupPhasesPath);
   try {
-    const stats = fs.statSync(file);
-    if (stats.size === 0) return false;
-    const buffer = Buffer.alloc(1);
-    fd = fs.openSync(file, 'r');
-    if (fs.readSync(fd, buffer, 0, 1, stats.size - 1) !== 1) return false;
-    return buffer[0] !== 0x0a;
-  } catch {
-    return false;
+    // A crash mid-append can leave no trailing newline; glue two appends and both are lost.
+    const offset = fs.fstatSync(descriptor).size;
+    const glue = offset > 0 && !lastByteIsNewline(descriptor, offset) ? '\n' : '';
+    fs.writeSync(descriptor, `${glue}${line}`);
   } finally {
-    if (fd !== undefined) fs.closeSync(fd);
+    fs.closeSync(descriptor);
+  }
+}
+
+function openMarkerForAppend(startupPhasesPath: string): number {
+  const noFollow = fs.constants.O_NOFOLLOW;
+  // READ-WRITE: the glue a crashed append needs is read back through this same descriptor, so the
+  // marker is never read at its final name either.
+  const appendFlags =
+    fs.constants.O_RDWR |
+    fs.constants.O_APPEND |
+    (Number.isInteger(noFollow) && noFollow > 0 ? noFollow : 0);
+  const existing = lstatIfPresent(startupPhasesPath);
+  if (existing === undefined) {
+    try {
+      return openChecked(
+        startupPhasesPath,
+        appendFlags | fs.constants.O_CREAT | fs.constants.O_EXCL,
+      );
+    } catch (error) {
+      // Somebody created it between the look and the open. It is judged below like any entry this
+      // call did not make.
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+  } else if (!existing.isFile()) {
+    throw notARegularFile(startupPhasesPath);
+  } else {
+    return openChecked(startupPhasesPath, appendFlags, existing);
+  }
+  const raced = lstatIfPresent(startupPhasesPath);
+  if (raced === undefined || !raced.isFile()) throw notARegularFile(startupPhasesPath);
+  return openChecked(startupPhasesPath, appendFlags, raced);
+}
+
+/** Opens the marker and proves the descriptor reached the entry `lstat` described. */
+function openChecked(startupPhasesPath: string, flags: number, before?: fs.Stats): number {
+  const descriptor = fs.openSync(startupPhasesPath, flags, PRIVATE_FILE_MODE);
+  try {
+    const opened = fs.fstatSync(descriptor);
+    if (!opened.isFile()) throw notARegularFile(startupPhasesPath);
+    if (before && (before.dev !== opened.dev || before.ino !== opened.ino)) {
+      throw new Error(`Startup marker identity changed as it was opened: ${startupPhasesPath}`);
+    }
+    return descriptor;
+  } catch (error) {
+    fs.closeSync(descriptor);
+    throw error;
+  }
+}
+
+function notARegularFile(startupPhasesPath: string): Error {
+  return new Error(
+    `Refusing to append the startup marker to a path that is not a regular file: ${startupPhasesPath}`,
+  );
+}
+
+const PRIVATE_FILE_MODE = 0o600;
+
+/** Whether the byte before `size` ends a line, read through the append descriptor itself. */
+function lastByteIsNewline(descriptor: number, size: number): boolean {
+  const buffer = Buffer.alloc(1);
+  if (fs.readSync(descriptor, buffer, 0, 1, size - 1) !== 1) return true;
+  return buffer[0] === 0x0a;
+}
+
+/** `lstat` that treats absence as `undefined`; every other errno propagates. */
+function lstatIfPresent(pathname: string): fs.Stats | undefined {
+  try {
+    return fs.lstatSync(pathname);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
   }
 }
 

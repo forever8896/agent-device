@@ -2,6 +2,10 @@ import { asAppError, normalizeError } from '@agent-device/kernel/errors';
 import { daemonStartupExitCode, reportDaemonClose, startDaemonRuntime } from '@agent-device/daemon';
 import { captureHostEnvironment } from '@agent-device/host-kit/process';
 import {
+  ensurePrivateDirectoryChain,
+  privateDirectoryWordingOf,
+} from '@agent-device/host-kit/file';
+import {
   removeDaemonStartupPhasesFile,
   recordDaemonStartupMarker,
   resolveDaemonStartupPhasesPath,
@@ -16,10 +20,21 @@ const reportMarkerFailure = (error: unknown): void => {
 // Captured once: the earliest marker and the runtime resolve the state dir from this one host,
 // so a relative AGENT_DEVICE_STATE_DIR cannot land the markers beside another directory's lock.
 const host = captureHostEnvironment(process);
-const ownPhasesPath = resolveDaemonStartupPhasesPath(
-  resolveDaemonPaths(host.env.AGENT_DEVICE_STATE_DIR, { env: host.env, cwd: host.cwd }).baseDir,
-  process.pid,
-);
+const ownStateDir = resolveDaemonPaths(host.env.AGENT_DEVICE_STATE_DIR, {
+  env: host.env,
+  cwd: host.cwd,
+}).baseDir;
+// Every state diagnostic this process writes from here on goes into that chain, so it is established
+// before the first one: 0700 at every level whatever the umask, and the narrowest best-effort repair of
+// a level this user owns. A chain the daemon does not own is written down and left as it is: a fact
+// about the host never refuses a startup (#4649).
+const stateDir = ensurePrivateDirectoryChain(ownStateDir);
+if (stateDir.exposure) {
+  process.stderr.write(
+    `Daemon state dir ${stateDir.directory} is not private: ${privateDirectoryWordingOf(stateDir.exposure)}\n`,
+  );
+}
+const ownPhasesPath = resolveDaemonStartupPhasesPath(ownStateDir, process.pid);
 // The claim first: after pid reuse it is the only defense against a dead lifetime's phases.
 removeDaemonStartupPhasesFile(ownPhasesPath, reportMarkerFailure);
 recordDaemonStartupMarker(ownPhasesPath, 'modules-loaded', reportMarkerFailure);

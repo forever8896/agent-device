@@ -15,7 +15,12 @@ import {
   type OwnerIdentity,
 } from '@agent-device/host-kit/process';
 import {
+  ensurePrivateDirectoryChain,
+  judgePrivateDirectoryChain,
+  privateDirectoryWordingOf,
+  PRIVATE_STATE_DIR_REASON,
   publishFileSync,
+  repairPrivateMode,
   inspectProcessLock,
   tryAcquireProcessLock,
   acquireProcessLockAcquisition,
@@ -154,8 +159,20 @@ export async function tryAcquireDaemonRegistration(
     if (!outcome) return;
     try {
       acquisition.assertHeld();
+      const destination = resolveDaemonShutdownReportPath(boundPaths.baseDir);
+      // The report is a state diagnostic, so it goes only into a chain this process owns, and its name
+      // is never opened: a temporary sibling is renamed over it (#4649). A chain that fails the rule
+      // costs the report, never the shutdown, and the reason still reaches `daemon.log`.
+      const ground = judgePrivateDirectoryChain(path.dirname(destination));
+      if (ground.exposure) {
+        throw new AppError(
+          'COMMAND_FAILED',
+          `Refusing to write the shutdown report under ${ground.directory}: ${privateDirectoryWordingOf(ground.exposure)}`,
+          { reason: PRIVATE_STATE_DIR_REASON, exposure: ground.exposure },
+        );
+      }
       publishFileSync({
-        destination: resolveDaemonShutdownReportPath(boundPaths.baseDir),
+        destination: path.join(ground.directory, path.basename(destination)),
         contents: `${JSON.stringify(buildDaemonShutdownReport(outcome))}\n`,
         mode: 0o600,
       });
@@ -276,26 +293,6 @@ export function createOwnedReplayStateDir(): OwnedReplayStateDir {
   return owned;
 }
 
-/**
- * Forces a pre-existing state path to the private mode, whatever mode it had. On Windows, chmod
- * only toggles the read-only bit, so it cannot make the path private. The repair never decides
- * whether the daemon starts: a path another user owns, or a mount without chmod, keeps its mode.
- */
-function repairStateMode(target: string, mode: number): void {
-  try {
-    fs.chmodSync(target, mode);
-  } catch (error) {
-    if (!MODE_REPAIR_SKIPPED_CODES.has((error as NodeJS.ErrnoException).code ?? '')) throw error;
-    emitDiagnostic({
-      level: 'warn',
-      phase: 'daemon_state_mode_repair_skipped',
-      data: { path: target, error: normalizeError(error) },
-    });
-  }
-}
-
-const MODE_REPAIR_SKIPPED_CODES = new Set(['EPERM', 'EROFS', 'ENOTSUP', 'EOPNOTSUPP']);
-
 /** Launches and monitors the actual child before recording its private-directory authority. */
 export function launchDaemonProcess(
   input: Readonly<{
@@ -314,11 +311,18 @@ export function launchDaemonProcess(
     throw new AppError('COMMAND_FAILED', 'Replay daemon startup admission is closed.', {
       reason: 'daemon_startup_admission_closed',
     });
-  fs.mkdirSync(input.paths.baseDir, { recursive: true, mode: 0o700 });
-  repairStateMode(input.paths.baseDir, 0o700);
+  // One call owns the boundary: 0700 creation whatever the umask, and the narrowest best-effort repair
+  // of a level this user already owns. The answer is a fact about the host, never a reason to refuse a
+  // startup, so a chain the daemon does not own is written down in the log and left exactly as it is.
+  const stateDir = ensurePrivateDirectoryChain(input.paths.baseDir);
+  if (stateDir.exposure) {
+    process.stderr.write(
+      `Daemon state dir ${stateDir.directory} is not private: ${privateDirectoryWordingOf(stateDir.exposure)}\n`,
+    );
+  }
   const logFd = fs.openSync(input.paths.logPath, 'a', 0o600);
   try {
-    repairStateMode(input.paths.logPath, 0o600);
+    repairPrivateMode(input.paths.logPath, 0o600);
     const monitored = runCmdDetachedMonitored(process.execPath, input.args, {
       cwd: input.cwd,
       env: {
