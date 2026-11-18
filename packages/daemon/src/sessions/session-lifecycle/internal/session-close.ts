@@ -358,7 +358,7 @@ export async function handleSessionCloseCommands(
       clearRuntimeHints: admission.clearRuntimeHints,
       repairArmed: repair.repairArmed,
       platformResourceCleanup,
-      observeDeviceBoot: params.platformServices.observeBootTimeForImplicitShutdown,
+      observeDeviceBoot: params.platformServices.deviceBootObservation.observeBootTimeMs,
       deviceShutdownDenied: params.deviceShutdownDenied,
     }),
   );
@@ -428,7 +428,7 @@ async function runCloseTeardownAndRelease(params: {
   platformResourceCleanup: PlatformResourceCleanup;
   deviceShutdownDenied?: boolean;
   /** Boot observation for the implicit stop's #4585 check, forwarded to the teardown. */
-  observeDeviceBoot?: DeviceBootObservationService['observeBootTimeMs'];
+  observeDeviceBoot: DeviceBootObservationService['observeBootTimeMs'];
 }): Promise<SessionCloseFinalization> {
   const {
     req,

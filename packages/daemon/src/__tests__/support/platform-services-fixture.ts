@@ -27,7 +27,6 @@ export function daemonPlatformServicesFixture(
     deviceBootObservation: Object.freeze({
       observeBootTimeMs: observeBootTimeMsFixture,
     }),
-    observeBootTimeForImplicitShutdown: observeBootTimeMsFixture,
     ensureLocalDeviceReady: ensureLocalDeviceReadyFixture,
     resolveRequestedOpenSurface: resolveRequestedOpenSurfaceFixture,
     validateOpenRelaunchTarget: validateOpenRelaunchTargetFixture,

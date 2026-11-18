@@ -61,18 +61,15 @@ export type SessionCloseTeardownResult = Readonly<{
   Omit<CloseDeviceStopDecision, 'shutdownRequested'>;
 
 /**
- * Whether the device's current boot began after the boot this session caused, which is the only
- * reading that proves the running device is not the one this session started. An unanswered probe
- * proves nothing and keeps the stop the session owes, and so does a probe that cannot be asked at
- * all: a decision aid never becomes the reason a close fails or loses its session. A session that
- * owes a stop without a stamp cannot be checked and keeps its stop for the same reason.
+ * Only cold Android opens record a readiness timestamp. An unanswered probe leaves the stop
+ * decision unchanged.
  */
 async function deviceRebootedSinceSessionBoot(params: {
   device: DeviceInfo;
   bootedByOpenAtMs: number | undefined;
-  observeDeviceBoot: DeviceBootObservationService['observeBootTimeMs'] | undefined;
+  observeDeviceBoot: DeviceBootObservationService['observeBootTimeMs'];
 }): Promise<boolean> {
-  if (!params.observeDeviceBoot || params.bootedByOpenAtMs === undefined) return false;
+  if (params.bootedByOpenAtMs === undefined) return false;
   const observation = await params
     .observeDeviceBoot(params.device)
     .catch((): DeviceBootObservation => ({ observed: false, reason: 'unobserved' }));
@@ -98,7 +95,7 @@ async function decideDeviceStopOnClose(params: {
   session: SessionState;
   localFamily: boolean;
   deviceShutdownDenied: boolean;
-  observeDeviceBoot: DeviceBootObservationService['observeBootTimeMs'] | undefined;
+  observeDeviceBoot: DeviceBootObservationService['observeBootTimeMs'];
 }): Promise<CloseDeviceStopDecision> {
   const { session } = params;
   const implicitShutdown =
@@ -152,14 +149,7 @@ export async function runSessionCloseTeardown(params: {
   }): OrdinaryCloseScript;
   platformResourceCleanup: PlatformResourceCleanup;
   deviceShutdownDenied?: boolean;
-  /**
-   * Asks the device when its CURRENT boot began, which is the only evidence that distinguishes the
-   * boot this session's `open` caused from a boot someone else caused afterwards. A close without
-   * it keeps the stop decision it made before #4585. Every device answer, including a probe that
-   * cannot read the device, arrives as `unobserved` and keeps that decision; only an observed boot
-   * later than this session's own moves it.
-   */
-  observeDeviceBoot?: DeviceBootObservationService['observeBootTimeMs'];
+  observeDeviceBoot: DeviceBootObservationService['observeBootTimeMs'];
 }): Promise<SessionCloseTeardownResult> {
   const {
     req,

@@ -16,7 +16,6 @@ vi.mock('@agent-device/platform-apple/simulator-boot', () => mocks);
 vi.mock('@agent-device/platform-android/device-boot', () => mocks);
 
 import {
-  ANDROID_DEVICE,
   ANDROID_EMULATOR,
   IOS_SIMULATOR,
   IPADOS_SIMULATOR,
@@ -25,10 +24,7 @@ import {
   TVOS_SIMULATOR,
   VISIONOS_SIMULATOR,
 } from '@agent-device/test-kit';
-import {
-  deviceBootObservation,
-  observeBootTimeForImplicitShutdown,
-} from './platform-runtime-device-boot.ts';
+import { deviceBootObservation } from './platform-runtime-device-boot.ts';
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -71,21 +67,4 @@ test('a device whose family asks no boot question is refused without loading a p
   }
   expect(mocks.observeSimulatorBootTimeMs).not.toHaveBeenCalled();
   expect(mocks.observeAndroidBootTimeMs).not.toHaveBeenCalled();
-});
-
-test('the implicit-stop reboot guard probes Android emulators only', async () => {
-  for (const device of [IOS_SIMULATOR, ANDROID_DEVICE]) {
-    expect(await observeBootTimeForImplicitShutdown(device)).toEqual({
-      observed: false,
-      reason: 'unsupported-device',
-    });
-  }
-  expect(mocks.observeSimulatorBootTimeMs).not.toHaveBeenCalled();
-  expect(mocks.observeAndroidBootTimeMs).not.toHaveBeenCalled();
-
-  expect(await observeBootTimeForImplicitShutdown(ANDROID_EMULATOR)).toEqual({
-    observed: false,
-    reason: 'unobserved',
-  });
-  expect(mocks.observeAndroidBootTimeMs).toHaveBeenCalledExactlyOnceWith(ANDROID_EMULATOR);
 });

@@ -89,17 +89,17 @@ function createRoutedSession(
     ...process.env,
     AGENT_DEVICE_CLAIMS_DIR: path.join(stateDir, 'claims'),
   };
-  // The close-specific platform port supplies the emulator's observed boot time.
+  // The platform port supplies the emulator's observed boot time.
   const boot: { current: DeviceBootObservation } = {
     current: { observed: false, reason: 'unobserved' },
   };
   let bootAsks = 0;
   const platformServices = daemonPlatformServicesFixture({
-    observeBootTimeForImplicitShutdown: async (
-      device: DeviceInfo,
-    ): Promise<DeviceBootObservation> => {
-      bootAsks += 1;
-      return (await observeBootTimeMs?.(device)) ?? boot.current;
+    deviceBootObservation: {
+      observeBootTimeMs: async (device: DeviceInfo): Promise<DeviceBootObservation> => {
+        bootAsks += 1;
+        return (await observeBootTimeMs?.(device)) ?? boot.current;
+      },
     },
   }) as unknown as DaemonPlatformServices;
   const sessionStore = new SessionStore(path.join(stateDir, 'sessions'), {

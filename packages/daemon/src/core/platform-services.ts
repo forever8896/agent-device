@@ -20,8 +20,6 @@ export type EnsureLocalDeviceReady = (device: DeviceInfo) => Promise<boolean>;
 export type DaemonPlatformServices = Readonly<{
   appleSessionObservation: AppleSessionObservation;
   deviceBootObservation: DeviceBootObservationService;
-  /** Reports boot time only for device kinds that support the implicit-stop reboot guard. */
-  observeBootTimeForImplicitShutdown: DeviceBootObservationService['observeBootTimeMs'];
   ensureLocalDeviceReady: EnsureLocalDeviceReady;
   resolveRequestedOpenSurface(params: {
     device: DeviceInfo;
