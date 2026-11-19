@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, macos-15]
+        os: [macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     steps:
@@ -59,6 +59,7 @@ jobs:
       - name: Time the raw calls
         env:
           UDID: ${{ steps.sim.outputs.udid }}
+        shell: bash {0}
         run: |
           count() { cat "$(xcrun simctl get_app_container "$UDID" dev.shakecount data)/Documents/shakes.txt" 2>/dev/null || echo "?"; }
           # Runs a command with a wall-clock cap and prints how long it took.
@@ -76,8 +77,8 @@ jobs:
           file "$ROOT/usr/bin/notifyutil" || true
           echo "counter at start: $(count)"
           echo "== baseline spawn"
-          timed 120 xcrun simctl spawn "$UDID" /usr/bin/uname -a
-          timed 120 xcrun simctl spawn "$UDID" /usr/bin/uname -a
+          timed 120 xcrun simctl spawn "$UDID" notifyutil -p dev.shakecount.baseline
+          timed 120 xcrun simctl spawn "$UDID" notifyutil -p dev.shakecount.baseline
           for i in 1 2 3 4; do
             echo "== shake $i"
             timed 180 xcrun simctl spawn "$UDID" notifyutil -p com.apple.UIKit.SimulatorShake
