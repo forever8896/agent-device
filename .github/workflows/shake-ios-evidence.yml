@@ -89,6 +89,10 @@ jobs:
           $AD open dev.shakecount --platform ios --udid "$UDID" --session "$SESSION"
           sleep 3
           echo "counter before: $(count)"
+          # Times an unrelated notification through the same simctl route while the session is open.
+          for i in 1 2 3; do
+            S=$(date +%s); xcrun simctl spawn "$UDID" notifyutil -p dev.shakecount.baseline; echo "raw spawn $i: exit $? after $(( $(date +%s) - S ))s"
+          done
           test "$(count)" = 0
           xcrun simctl io "$UDID" screenshot evidence-out/before.png
           for expected in 1 2 3; do
